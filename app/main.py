@@ -2,19 +2,23 @@ import logging
 import logging.config
 import time
 import os
+import asyncio
 from datetime import datetime
 from pathlib import Path
-from fastapi import FastAPI, Request, HTTPException, Depends
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 import psutil
 import uvicorn
 from sqlalchemy.orm import Session
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from app.core.config import settings
 from app.core.database import engine, Base, get_db
@@ -25,6 +29,11 @@ from app.core.exceptions import (
     validation_exception_handler,
     general_exception_handler
 )
+from app.core.logging_config import setup_production_logging
+from app.core.security import security_validator, rate_limiter
+from app.services.cache_service import cache_service
+from app.monitoring.health_checks import health_checker
+from app.services.ai_circuit_breaker import openai_circuit_breaker
 
 # Import API routers
 from app.api.v1 import (
@@ -37,6 +46,13 @@ from app.api.v1 import (
     analytics
 )
 from app.api.v1.websocket import router as websocket_router
+
+# Application startup time
+app_start_time = datetime.utcnow()
+
+# Setup logging first
+loggers = setup_production_logging()
+logger = loggers["app"]
 
 # Enhanced middleware classes
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -52,230 +68,187 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline'"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src 'self' https://fonts.gstatic.com; "
+            "img-src 'self' data: https:; "
+            "connect-src 'self' https:"
+        )
         
         return response
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Enhanced rate limiting middleware with IP tracking"""
+    """Enhanced rate limiting middleware with different tiers"""
     
     def __init__(self, app, calls: int = 100, period: int = 60):
         super().__init__(app)
         self.calls = calls
         self.period = period
-        self.clients = {}
 
     async def dispatch(self, request: Request, call_next):
         client_ip = request.client.host
-        now = time.time()
         
-        # Initialize client if not exists
-        if client_ip not in self.clients:
-            self.clients[client_ip] = []
-        
-        # Clean old requests
-        self.clients[client_ip] = [
-            req_time for req_time in self.clients[client_ip]
-            if now - req_time < self.period
-        ]
+        # Determine rate limit tier based on endpoint
+        tier = "standard"
+        if "/ai/" in str(request.url):
+            tier = "ai_heavy"
+        elif request.method in ["POST", "PUT", "DELETE"]:
+            tier = "premium"
         
         # Check rate limit
-        if len(self.clients[client_ip]) >= self.calls:
-            logger.warning(f"Rate limit exceeded for IP: {client_ip}")
+        if not rate_limiter.is_allowed(client_ip, tier):
+            logger.warning(f"Rate limit exceeded for IP: {client_ip}, tier: {tier}")
             return JSONResponse(
                 status_code=429,
                 content={
                     "error": "Rate limit exceeded",
-                    "detail": f"Maximum {self.calls} requests per {self.period} seconds allowed",
-                    "retry_after": self.period
+                    "detail": f"Maximum requests per hour exceeded for tier: {tier}",
+                    "retry_after": 3600
                 }
             )
-        
-        # Record this request
-        self.clients[client_ip].append(now)
         
         response = await call_next(request)
         
         # Add rate limit headers
-        response.headers["X-RateLimit-Limit"] = str(self.calls)
-        response.headers["X-RateLimit-Remaining"] = str(self.calls - len(self.clients[client_ip]))
-        response.headers["X-RateLimit-Reset"] = str(int(now + self.period))
+        remaining = rate_limiter.rate_limits[tier]['requests'] - len(rate_limiter.client_requests.get(client_ip, []))
+        response.headers["X-RateLimit-Limit"] = str(rate_limiter.rate_limits[tier]['requests'])
+        response.headers["X-RateLimit-Remaining"] = str(max(0, remaining))
+        response.headers["X-RateLimit-Reset"] = str(int(time.time() + rate_limiter.rate_limits[tier]['window']))
         
         return response
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    """Enhanced request/response logging middleware"""
+    """Enhanced request/response logging middleware with performance tracking"""
     
     async def dispatch(self, request: Request, call_next):
         start_time = time.time()
+        request_id = f"req_{int(start_time * 1000000)}"
         
         # Log request
         logger.info(
-            f"Request: {request.method} {request.url} - "
-            f"IP: {request.client.host} - "
-            f"User-Agent: {request.headers.get('user-agent', 'Unknown')}"
+            f"Request started",
+            extra={
+                "request_id": request_id,
+                "method": request.method,
+                "url": str(request.url),
+                "ip": request.client.host,
+                "user_agent": request.headers.get("user-agent", "Unknown")
+            }
         )
         
-        response = await call_next(request)
+        # Add request ID to request state
+        request.state.request_id = request_id
         
-        # Log response
-        process_time = time.time() - start_time
-        logger.info(
-            f"Response: {response.status_code} - "
-            f"Time: {process_time:.4f}s - "
-            f"IP: {request.client.host}"
-        )
-        
-        response.headers["X-Process-Time"] = str(process_time)
-        return response
+        try:
+            response = await call_next(request)
+            
+            # Log response
+            process_time = time.time() - start_time
+            logger.info(
+                f"Request completed",
+                extra={
+                    "request_id": request_id,
+                    "status_code": response.status_code,
+                    "duration_ms": round(process_time * 1000, 2),
+                    "ip": request.client.host
+                }
+            )
+            
+            response.headers["X-Request-ID"] = request_id
+            response.headers["X-Process-Time"] = str(round(process_time, 4))
+            
+            return response
+            
+        except Exception as e:
+            process_time = time.time() - start_time
+            logger.error(
+                f"Request failed",
+                extra={
+                    "request_id": request_id,
+                    "error": str(e),
+                    "duration_ms": round(process_time * 1000, 2),
+                    "ip": request.client.host
+                },
+                exc_info=True
+            )
+            raise
 
-# Setup comprehensive logging
-def setup_logging():
-    """Setup comprehensive logging configuration"""
+# Application lifespan management
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Enhanced application lifespan management"""
     
-    # Create logs directory
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-    
-    # Logging configuration
-    LOGGING_CONFIG = {
-        "version": 1,
-        "disable_existing_loggers": False,
-        "formatters": {
-            "default": {
-                "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-                "datefmt": "%Y-%m-%d %H:%M:%S"
-            },
-            "detailed": {
-                "format": "%(asctime)s - %(name)s - %(levelname)s - %(pathname)s:%(lineno)d - %(message)s",
-                "datefmt": "%Y-%m-%d %H:%M:%S"
-            }
-        },
-        "handlers": {
-            "console": {
-                "class": "logging.StreamHandler",
-                "level": "INFO",
-                "formatter": "default",
-                "stream": "ext://sys.stdout"
-            },
-            "file_info": {
-                "class": "logging.handlers.RotatingFileHandler",
-                "level": "INFO",
-                "formatter": "detailed",
-                "filename": log_dir / "app.log",
-                "maxBytes": 10 * 1024 * 1024,  # 10MB
-                "backupCount": 5
-            },
-            "file_error": {
-                "class": "logging.handlers.RotatingFileHandler", 
-                "level": "ERROR",
-                "formatter": "detailed",
-                "filename": log_dir / "error.log",
-                "maxBytes": 10 * 1024 * 1024,
-                "backupCount": 3
-            }
-        },
-        "loggers": {
-            "app": {
-                "handlers": ["console", "file_info", "file_error"],
-                "level": "DEBUG" if settings.DEBUG else "INFO",
-                "propagate": False
-            },
-            "ai_service": {
-                "handlers": ["console", "file_info"],
-                "level": "INFO",
-                "propagate": False
-            },
-            "uvicorn": {
-                "handlers": ["console"],
-                "level": "INFO",
-                "propagate": False
-            },
-            "sqlalchemy.engine": {
-                "handlers": ["file_info"],
-                "level": "WARNING",
-                "propagate": False
-            }
-        },
-        "root": {
-            "handlers": ["console", "file_info", "file_error"],
-            "level": "INFO"
-        }
-    }
-    
-    logging.config.dictConfig(LOGGING_CONFIG)
-    return logging.getLogger("app")
-
-# Initialize logging
-logger = setup_logging()
-
-# Application startup time
-app_start_time = datetime.utcnow()
-
-# Create database tables
-try:
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database tables created successfully")
-except Exception as e:
-    logger.error(f"Failed to create database tables: {e}")
-
-# Initialize FastAPI app
-app = FastAPI(
-    title=settings.PROJECT_NAME,
-    version=settings.VERSION,
-    description="AI-Powered Virtual Internship Platform Backend - Production Ready",
-    openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    docs_url=f"{settings.API_V1_STR}/docs",
-    redoc_url=f"{settings.API_V1_STR}/redoc"
-)
-
-# Application Events
-@app.on_event("startup")
-async def startup_event():
-    """Enhanced application startup tasks"""
+    # Startup
     logger.info(f"🚀 Starting {settings.PROJECT_NAME} v{settings.VERSION}")
     logger.info(f"Environment: {settings.ENVIRONMENT}")
     logger.info(f"Debug Mode: {settings.DEBUG}")
     
-    # Initialize AI services with error handling
     try:
+        # Create necessary directories
+        for directory in ["logs", "uploads", "backups", "temp"]:
+            Path(directory).mkdir(exist_ok=True)
+        
+        # Initialize services
+        await cache_service.initialize()
+        await health_checker.initialize()
+        
+        # Test database connectivity
+        with engine.connect() as conn:
+            conn.execute("SELECT 1")
+        logger.info("✅ Database connection established")
+        
+        # Initialize AI services
         from app.services.ai_service import ai_service
         health = await ai_service.get_ai_service_health()
         if health["status"] == "healthy":
             logger.info("✅ AI services initialized successfully")
         else:
             logger.warning("⚠️ AI services initialized with warnings")
+        
+        # Create database tables
+        Base.metadata.create_all(bind=engine)
+        logger.info("✅ Database tables verified")
+        
+        logger.info("🎯 Application startup completed successfully")
+        
+        yield
+        
     except Exception as e:
-        logger.error(f"❌ Failed to initialize AI services: {e}")
+        logger.error(f"❌ Application startup failed: {e}")
+        raise
     
-    # Test database connectivity
-    try:
-        with engine.connect() as conn:
-            conn.execute("SELECT 1")
-        logger.info("✅ Database connection established")
-    except Exception as e:
-        logger.error(f"❌ Database connection failed: {e}")
-    
-    # Create necessary directories
-    for directory in ["logs", "uploads", "backups"]:
-        Path(directory).mkdir(exist_ok=True)
-    
-    logger.info("🎯 Application startup completed successfully")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Enhanced application shutdown tasks"""
+    # Shutdown
     uptime = datetime.utcnow() - app_start_time
     logger.info(f"🛑 Shutting down {settings.PROJECT_NAME}")
     logger.info(f"⏱️ Total uptime: {uptime}")
     
-    # Log final statistics
     try:
+        # Get final statistics
         from app.services.ai_service import ai_service
         credits = await ai_service.check_ai_credits()
-        logger.info(f"📊 AI Service Stats - Requests: {credits['total_requests']}, Cost: ${credits['total_cost']}")
+        logger.info(f"📊 Final AI Stats - Requests: {credits['total_requests']}, Cost: ${credits['total_cost']}")
+        
+        # Close connections
+        if cache_service.redis_client:
+            await cache_service.redis_client.close()
+        
+        logger.info("✅ Graceful shutdown completed")
+        
     except Exception as e:
-        logger.warning(f"Failed to get final AI stats: {e}")
+        logger.warning(f"⚠️ Shutdown warning: {e}")
+
+# Initialize FastAPI app with enhanced configuration
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    version=settings.VERSION,
+    description="AI-Powered Virtual Internship Platform Backend - Production Ready",
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    docs_url=f"{settings.API_V1_STR}/docs",
+    redoc_url=f"{settings.API_V1_STR}/redoc",
+    lifespan=lifespan
+)
 
 # Exception handlers
 app.add_exception_handler(BaseAPIException, base_api_exception_handler)
@@ -285,7 +258,7 @@ app.add_exception_handler(Exception, general_exception_handler)
 
 # Enhanced Middleware Stack (order matters!)
 app.add_middleware(SecurityHeadersMiddleware)
-app.add_middleware(RateLimitMiddleware, calls=100, period=60)
+app.add_middleware(RateLimitMiddleware, calls=100, period=3600)
 app.add_middleware(LoggingMiddleware)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
@@ -302,7 +275,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Static files (if needed)
+# Static files
 if Path("static").exists():
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -356,7 +329,7 @@ app.include_router(
     tags=["WebSocket"]
 )
 
-# Enhanced Health Check Endpoints
+# Enhanced Health Check and Monitoring Endpoints
 @app.get("/")
 async def root():
     """Enhanced root endpoint with comprehensive API information"""
@@ -373,79 +346,61 @@ async def root():
             "👨‍🎓 Intern Management",
             "👨‍🏫 Mentor System",
             "📋 Task Management", 
-            "🤖 AI Agents",
+            "🤖 AI Agents with Circuit Breakers",
             "📚 Learning Management",
             "📊 Analytics & Reporting",
             "🔄 Real-time Communication",
             "🛡️ Security & Rate Limiting",
-            "📈 Monitoring & Logging"
+            "📈 Monitoring & Logging",
+            "🚀 Background Task Processing",
+            "💾 Redis Caching",
+            "🔍 Comprehensive Health Checks"
         ],
         "endpoints": {
             "docs": f"{settings.API_V1_STR}/docs",
             "redoc": f"{settings.API_V1_STR}/redoc",
             "health": "/health",
-            "metrics": "/metrics"
+            "metrics": "/metrics",
+            "prometheus": "/prometheus"
         },
         "timestamp": datetime.utcnow().isoformat()
     }
 
 @app.get("/health")
-async def health_check(db: Session = Depends(get_db)):
+async def health_check():
     """Comprehensive health check endpoint"""
-    health_status = {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "version": settings.VERSION,
-        "environment": settings.ENVIRONMENT,
-        "uptime": str(datetime.utcnow() - app_start_time),
-        "checks": {}
-    }
     
-    # Database health check
     try:
-        db.execute("SELECT 1")
-        health_status["checks"]["database"] = {
-            "status": "healthy",
-            "response_time_ms": 0  # You could measure actual response time
+        health_data = await health_checker.comprehensive_health_check()
+        
+        # Add circuit breaker status
+        health_data["circuit_breakers"] = {
+            "openai": openai_circuit_breaker.get_status()
         }
+        
+        # Add cache status
+        cache_stats = await cache_service.get_stats()
+        health_data["cache"] = cache_stats
+        
+        # Determine HTTP status code based on health
+        status_code = 200
+        if health_data["status"] == "degraded":
+            status_code = 503
+        elif health_data["status"] == "unhealthy":
+            status_code = 503
+        
+        return JSONResponse(content=health_data, status_code=status_code)
+        
     except Exception as e:
-        logger.error(f"Database health check failed: {e}")
-        health_status["checks"]["database"] = {
-            "status": "unhealthy",
-            "error": str(e)
-        }
-        health_status["status"] = "degraded"
-    
-    # AI service health check
-    try:
-        from app.services.ai_service import get_ai_service_health
-        ai_health = await get_ai_service_health()
-        health_status["checks"]["ai_service"] = ai_health
-        if ai_health["status"] != "healthy":
-            health_status["status"] = "degraded"
-    except Exception as e:
-        logger.error(f"AI service health check failed: {e}")
-        health_status["checks"]["ai_service"] = {
-            "status": "unhealthy",
-            "error": str(e)
-        }
-        health_status["status"] = "degraded"
-    
-    # File system health check
-    try:
-        test_file = Path("logs") / "health_check.tmp"
-        test_file.write_text("health_check")
-        test_file.unlink()
-        health_status["checks"]["filesystem"] = {"status": "healthy"}
-    except Exception as e:
-        logger.error(f"Filesystem health check failed: {e}")
-        health_status["checks"]["filesystem"] = {
-            "status": "unhealthy",
-            "error": str(e)
-        }
-        health_status["status"] = "degraded"
-    
-    return health_status
+        logger.error(f"Health check failed: {e}")
+        return JSONResponse(
+            content={
+                "status": "unhealthy",
+                "error": str(e),
+                "timestamp": datetime.utcnow().isoformat()
+            },
+            status_code=503
+        )
 
 @app.get("/metrics")
 async def metrics():
@@ -460,12 +415,11 @@ async def metrics():
         uptime = datetime.utcnow() - app_start_time
         
         # AI service metrics
-        try:
-            from app.services.ai_service import ai_service
-            ai_credits = await ai_service.check_ai_credits()
-        except Exception as e:
-            logger.warning(f"Failed to get AI metrics: {e}")
-            ai_credits = {"error": "AI metrics unavailable"}
+        from app.services.ai_service import ai_service
+        ai_credits = await ai_service.check_ai_credits()
+        
+        # Cache metrics
+        cache_stats = await cache_service.get_stats()
         
         return {
             "timestamp": datetime.utcnow().isoformat(),
@@ -476,7 +430,8 @@ async def metrics():
                 "memory_used_mb": round(memory.used / 1024 / 1024, 2),
                 "disk_percent": round(disk.percent, 2),
                 "disk_free_gb": round(disk.free / 1024 / 1024 / 1024, 2),
-                "disk_used_gb": round(disk.used / 1024 / 1024 / 1024, 2)
+                "disk_used_gb": round(disk.used / 1024 / 1024 / 1024, 2),
+                "load_average": list(psutil.getloadavg()) if hasattr(psutil, 'getloadavg') else None
             },
             "application": {
                 "version": settings.VERSION,
@@ -486,17 +441,24 @@ async def metrics():
                 "start_time": app_start_time.isoformat()
             },
             "ai_service": ai_credits,
-            "features": {
-                "debug_mode": settings.DEBUG,
-                "rate_limiting": True,
-                "security_headers": True,
-                "logging": True,
-                "monitoring": True
+            "cache": cache_stats,
+            "circuit_breakers": {
+                "openai": openai_circuit_breaker.get_status()
             }
         }
     except Exception as e:
         logger.error(f"Metrics collection failed: {e}")
         raise HTTPException(status_code=503, detail="Metrics temporarily unavailable")
+
+@app.get("/prometheus")
+async def prometheus_metrics():
+    """Prometheus metrics endpoint"""
+    try:
+        from app.monitoring.health_checks import generate_latest
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    except Exception as e:
+        logger.error(f"Prometheus metrics failed: {e}")
+        raise HTTPException(status_code=503, detail="Prometheus metrics unavailable")
 
 @app.get("/status")
 async def status():
@@ -507,7 +469,6 @@ async def status():
         "timestamp": datetime.utcnow().isoformat()
     }
 
-# Production readiness check endpoint
 @app.get("/readiness")
 async def readiness_check(db: Session = Depends(get_db)):
     """Kubernetes-style readiness probe"""
@@ -521,17 +482,41 @@ async def readiness_check(db: Session = Depends(get_db)):
             if not Path(dir_name).exists():
                 raise Exception(f"Required directory {dir_name} not found")
         
+        # Check AI service
+        from app.services.ai_service import ai_service
+        ai_health = await ai_service.get_ai_service_health()
+        if ai_health["status"] == "unhealthy":
+            raise Exception("AI service not ready")
+        
         return {"status": "ready", "timestamp": datetime.utcnow().isoformat()}
         
     except Exception as e:
         logger.error(f"Readiness check failed: {e}")
-        raise HTTPException(status_code=503, detail="Service not ready")
+        raise HTTPException(status_code=503, detail=f"Service not ready: {str(e)}")
 
-# Liveness probe for Kubernetes
 @app.get("/liveness")
 async def liveness_check():
     """Kubernetes-style liveness probe"""
     return {"status": "alive", "timestamp": datetime.utcnow().isoformat()}
+
+# Development endpoint (only in debug mode)
+if settings.DEBUG:
+    @app.get("/debug/info")
+    async def debug_info():
+        """Debug information endpoint (only available in debug mode)"""
+        return {
+            "settings": {
+                "database_url": settings.DATABASE_URL[:50] + "..." if settings.DATABASE_URL else None,
+                "redis_url": settings.REDIS_URL[:50] + "..." if settings.REDIS_URL else None,
+                "environment": settings.ENVIRONMENT,
+                "debug": settings.DEBUG
+            },
+            "system": {
+                "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+                "platform": platform.platform(),
+                "process_id": os.getpid()
+            }
+        }
 
 if __name__ == "__main__":
     uvicorn.run(

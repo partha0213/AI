@@ -1,66 +1,115 @@
-from datetime import datetime, timedelta
-from typing import Optional, Union, Any
-from jose import jwt, JWTError
-from passlib.context import CryptContext
-from passlib.hash import bcrypt
+import secrets
+import hashlib
+import re
+from typing import List, Dict, Any
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import HTTPException, status
-from .config import settings
+import logging
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+logger = logging.getLogger(__name__)
 
-def create_access_token(
-    subject: Union[str, Any], expires_delta: Optional[timedelta] = None
-) -> str:
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(
-            minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
-        )
+class SecurityConfig:
+    """Production security configuration"""
     
-    to_encode = {"exp": expire, "sub": str(subject)}
-    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
-    return encoded_jwt
+    # Generate secure random keys
+    SECRET_KEY = secrets.token_urlsafe(32)
+    ALGORITHM = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES = 30
+    
+    # Security settings
+    ALLOWED_ORIGINS = [
+        "https://yourdomain.com",
+        "https://www.yourdomain.com",
+        "https://admin.yourdomain.com"
+    ]
+    
+    # Rate limiting
+    RATE_LIMIT_PER_MINUTE = 60
+    RATE_LIMIT_BURST = 100
+    
+    # File upload security
+    MAX_FILE_SIZE_MB = 50
+    ALLOWED_FILE_TYPES = ['.pdf', '.doc', '.docx', '.jpg', '.jpeg', '.png']
+    
+    # AI-specific security
+    MAX_PROMPT_LENGTH = 4000
+    BLOCKED_PATTERNS = [
+        "ignore previous instructions",
+        "act as",
+        "pretend to be",
+        "system:",
+        "assistant:",
+        "jailbreak",
+        "dev mode"
+    ]
 
-def verify_token(token: str) -> Optional[str]:
-    try:
-        payload = jwt.decode(
-            token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
-        )
-        token_data = payload.get("sub")
-        if token_data is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Could not validate credentials",
-            )
-        return token_data
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
-        )
+class AISecurityValidator:
+    """Validates AI inputs for security threats"""
+    
+    @staticmethod
+    def validate_prompt(prompt: str) -> bool:
+        """Check prompt for injection attempts"""
+        prompt_lower = prompt.lower()
+        
+        for pattern in SecurityConfig.BLOCKED_PATTERNS:
+            if pattern in prompt_lower:
+                logger.warning(f"Blocked prompt injection attempt: {pattern}")
+                return False
+        
+        return True
+    
+    @staticmethod
+    def sanitize_input(text: str) -> str:
+        """Sanitize user input"""
+        # Remove potential script injections
+        text = re.sub(r'<script.*?</script>', '', text, flags=re.IGNORECASE | re.DOTALL)
+        
+        # Remove dangerous patterns
+        for pattern in SecurityConfig.BLOCKED_PATTERNS:
+            text = re.sub(pattern, '[REDACTED]', text, flags=re.IGNORECASE)
+        
+        # Limit length
+        if len(text) > SecurityConfig.MAX_PROMPT_LENGTH:
+            text = text[:SecurityConfig.MAX_PROMPT_LENGTH] + "...[truncated]"
+        
+        return text
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+class AdvancedRateLimiter:
+    """Advanced rate limiting with different tiers"""
+    
+    def __init__(self):
+        self.rate_limits = {
+            'standard': {'requests': 100, 'window': 3600},  # 100/hour
+            'premium': {'requests': 500, 'window': 3600},   # 500/hour
+            'ai_heavy': {'requests': 50, 'window': 3600}    # 50/hour for AI endpoints
+        }
+        self.client_requests = {}
+    
+    def is_allowed(self, client_id: str, tier: str = 'standard') -> bool:
+        """Check if request is within rate limit"""
+        import time
+        
+        now = time.time()
+        window = self.rate_limits[tier]['window']
+        limit = self.rate_limits[tier]['requests']
+        
+        if client_id not in self.client_requests:
+            self.client_requests[client_id] = []
+        
+        # Clean old requests
+        self.client_requests[client_id] = [
+            req_time for req_time in self.client_requests[client_id]
+            if now - req_time < window
+        ]
+        
+        # Check limit
+        if len(self.client_requests[client_id]) >= limit:
+            return False
+        
+        # Record request
+        self.client_requests[client_id].append(now)
+        return True
 
-def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
-
-def generate_password_reset_token(email: str) -> str:
-    delta = timedelta(hours=24)  # Token expires in 24 hours
-    now = datetime.utcnow()
-    expires = now + delta
-    exp = expires.timestamp()
-    encoded_jwt = jwt.encode(
-        {"exp": exp, "nbf": now, "sub": email}, 
-        settings.SECRET_KEY, 
-        algorithm="HS256"
-    )
-    return encoded_jwt
-
-def verify_password_reset_token(token: str) -> Optional[str]:
-    try:
-        decoded_token = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
-        return decoded_token["sub"]
-    except jwt.JWTError:
-        return None
+# Global instances
+security_validator = AISecurityValidator()
+rate_limiter = AdvancedRateLimiter()
