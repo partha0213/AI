@@ -32,7 +32,7 @@ from app.core.exceptions import (
 from app.core.logging_config import setup_production_logging
 from app.core.security import security_validator, rate_limiter
 from app.services.cache_service import cache_service
-from app.monitoring.health_checks import health_checker
+from monitoring.health_checks import health_checker
 from app.services.ai_circuit_breaker import openai_circuit_breaker
 
 # Import API routers
@@ -454,7 +454,7 @@ async def metrics():
 async def prometheus_metrics():
     """Prometheus metrics endpoint"""
     try:
-        from app.monitoring.health_checks import generate_latest
+        from monitoring.health_checks import generate_latest
         return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
     except Exception as e:
         logger.error(f"Prometheus metrics failed: {e}")

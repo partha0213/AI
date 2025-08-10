@@ -10,6 +10,22 @@ from app.models.user import User
 from app.schemas.intern import InternCreate, InternUpdate
 from app.utils.file_handler import file_handler
 from app.services.ai_service import analyze_resume_ai, assess_skills_ai
+# in app/services/learning_service.py
+
+from typing import Optional
+from sqlalchemy.orm import Session
+from app.models.learning import Quiz
+
+def get_quiz_by_id(db: Session, quiz_id: int) -> Optional[Quiz]:
+    """
+    Retrieve a single quiz by ID if active.
+    """
+    return (
+        db.query(Quiz)
+        .filter(Quiz.id == quiz_id, Quiz.is_active == True)  # noqa: E712
+        .first()
+    )
+
 
 def create_intern_profile(db: Session, intern: InternCreate, user_id: int) -> Intern:
     """Create intern profile"""
