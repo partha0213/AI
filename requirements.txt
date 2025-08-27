@@ -98,7 +98,7 @@ structlog==23.2.0
 aiohttp==3.9.1
 
 # Background tasks (if not already included)
-celery[redis]==5.3.4
+celery[redis]==5.0.1
 
 # Production server
 gunicorn==21.2.0
@@ -146,7 +146,7 @@ redis==5.0.1
 redis[hiredis]==5.0.1
 
 # Background tasks
-celery[redis]==5.3.4
+celery[redis]==5.0.1
 kombu==5.3.4
 vine==5.1.0
 
