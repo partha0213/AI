@@ -18,22 +18,19 @@ jobs:
           python-version: '3.11'
       
       - name: Install dependencies
-        working-directory: ai-virtual-intern-backend
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pytest pytest-asyncio
       
       - name: Run tests
-        working-directory: ai-virtual-intern-backend
         run: |
-          pytest ../tests/ -v
+          PYTHONPATH=$PWD/ai-virtual-intern-backend pytest tests/ -v
       
       - name: Run security check
-        working-directory: ai-virtual-intern-backend
         run: |
           pip install bandit safety
-          bandit -r app/
+          bandit -r $PWD/ai-virtual-intern-backend/app/
           safety check
 
   deploy:
