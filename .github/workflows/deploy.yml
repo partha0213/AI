@@ -8,6 +8,16 @@ on:
 
 env:
   PYTHON_VERSION: '3.11'
+  # Test environment variables
+  SECRET_KEY: 'test-secret-key-for-ci-testing-only'
+  DATABASE_URL: 'sqlite:///./test.db'
+  OPENAI_API_KEY: 'test-openai-key'
+  AWS_ACCESS_KEY_ID: 'test-aws-key'
+  AWS_SECRET_ACCESS_KEY: 'test-aws-secret'
+  AWS_BUCKET_NAME: 'test-bucket'
+  SMTP_HOST: 'test-smtp-host'
+  SMTP_USER: 'test-smtp-user'
+  SMTP_PASSWORD: 'test-smtp-password'
 
 jobs:
   test:
@@ -31,11 +41,8 @@ jobs:
       
       - name: Create missing directories and __init__.py files
         run: |
-          # Create directories if they don't exist
           mkdir -p ai-virtual-intern-backend/app
           mkdir -p tests
-          
-          # Create __init__.py files
           touch ai-virtual-intern-backend/__init__.py
           touch ai-virtual-intern-backend/app/__init__.py
           touch tests/__init__.py
@@ -44,7 +51,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           
-          # Check if requirements.txt exists in different locations
           if [ -f "requirements.txt" ]; then
             echo "Installing from root requirements.txt"
             pip install -r requirements.txt
@@ -52,59 +58,92 @@ jobs:
             echo "Installing from backend requirements.txt"
             pip install -r ai-virtual-intern-backend/requirements.txt
           else
-            echo "No requirements.txt found, installing basic dependencies"
-            pip install fastapi uvicorn sqlalchemy pytest pytest-asyncio pytest-cov
+            echo "Installing basic dependencies"
+            pip install fastapi uvicorn sqlalchemy pytest pytest-asyncio pytest-cov pydantic-settings
           fi
           
-          # Install testing and security tools
           pip install pytest pytest-asyncio pytest-cov bandit safety
+      
+      - name: Create test environment file
+        run: |
+          cat > ai-virtual-intern-backend/.env.test << EOF
+          SECRET_KEY=test-secret-key-for-ci-testing-only
+          DATABASE_URL=sqlite:///./test.db
+          OPENAI_API_KEY=test-openai-key
+          AWS_ACCESS_KEY_ID=test-aws-key
+          AWS_SECRET_ACCESS_KEY=test-aws-secret
+          AWS_BUCKET_NAME=test-bucket
+          SMTP_HOST=test-smtp-host
+          SMTP_USER=test-smtp-user
+          SMTP_PASSWORD=test-smtp-password
+          TESTING=true
+          EOF
       
       - name: Run tests with coverage
         run: |
           echo "Running tests..."
           
-          # Check if tests directory exists and has test files
           if [ -d "tests" ] && [ "$(find tests -name "test_*.py" -o -name "*_test.py" | wc -l)" -gt 0 ]; then
+            # Set working directory to backend and run tests
             cd ai-virtual-intern-backend
-            python -m pytest ../tests/ -v --cov=app --cov-report=xml --cov-report=term
+            
+            # Create a simple test database
+            python -c "
+import sqlite3
+conn = sqlite3.connect('test.db')
+conn.close()
+print('Test database created')
+            " || true
+            
+            # Run pytest with proper environment
+            python -m pytest ../tests/ -v --cov=app --cov-report=xml --cov-report=term --tb=short
           else
-            echo "No test files found, skipping tests"
-            # Create a dummy coverage file to prevent codecov error
+            echo "No test files found, creating dummy coverage file"
             mkdir -p ai-virtual-intern-backend
             echo '<?xml version="1.0" ?><coverage version="7.0.0"><sources></sources><packages></packages></coverage>' > ai-virtual-intern-backend/coverage.xml
           fi
         env:
           PYTHONPATH: ${{ github.workspace }}/ai-virtual-intern-backend
+          # Override with test values
+          SECRET_KEY: 'test-secret-key-for-ci-testing-only'
+          DATABASE_URL: 'sqlite:///./test.db'
+          OPENAI_API_KEY: 'test-openai-key'
+          AWS_ACCESS_KEY_ID: 'test-aws-key'
+          AWS_SECRET_ACCESS_KEY: 'test-aws-secret'
+          AWS_BUCKET_NAME: 'test-bucket'
+          SMTP_HOST: 'test-smtp-host'
+          SMTP_USER: 'test-smtp-user'
+          SMTP_PASSWORD: 'test-smtp-password'
+          TESTING: 'true'
       
       - name: Upload coverage reports
         uses: codecov/codecov-action@v3
-        if: always()
+        if: always() && hashFiles('ai-virtual-intern-backend/coverage.xml') != ''
         with:
           file: ./ai-virtual-intern-backend/coverage.xml
           fail_ci_if_error: false
           verbose: true
-        continue-on-error: true  # Don't fail the job if codecov fails
+        continue-on-error: true
       
       - name: Run security checks
         run: |
           echo "Running security checks..."
           
-          # Only run bandit if app directory exists
-          if [ -d "ai-virtual-intern-backend/app" ]; then
+          if [ -d "ai-virtual-intern-backend/app" ] && [ "$(find ai-virtual-intern-backend/app -name "*.py" | wc -l)" -gt 0 ]; then
             cd ai-virtual-intern-backend
-            bandit -r app/ -f json -o bandit-report.json || echo "Bandit scan completed with warnings"
+            bandit -r app/ -f json -o bandit-report.json || echo "Bandit completed with warnings"
           else
-            echo "App directory not found, skipping bandit scan"
+            echo "No Python files found in app directory, skipping bandit"
+            mkdir -p ai-virtual-intern-backend
             echo '{"results": [], "metrics": {"_totals": {"CONFIDENCE.HIGH": 0}}}' > ai-virtual-intern-backend/bandit-report.json
           fi
           
-          # Run safety check
-          safety check --json --output ai-virtual-intern-backend/safety-report.json || echo "Safety check completed with warnings"
+          safety check --json --output ai-virtual-intern-backend/safety-report.json || echo "Safety check completed"
         continue-on-error: true
       
       - name: Upload security reports
         uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && (hashFiles('ai-virtual-intern-backend/bandit-report.json') != '' || hashFiles('ai-virtual-intern-backend/safety-report.json') != '')
         with:
           name: security-reports
           path: |
@@ -155,41 +194,41 @@ jobs:
               chmod +x ./scripts/deploy.sh
               ./scripts/deploy.sh production
             else
-              echo "Deploy script not found, using basic deployment..."
-              # Basic deployment fallback
-              if [ -f "docker-compose.yml" ]; then
-                docker-compose down || true
-                docker-compose up -d --build
+              echo "Deploy script not found, using Docker deployment..."
+              if [ -f "docker-compose.yml" ] || [ -f "docker-compose.prod.yml" ]; then
+                docker-compose -f docker-compose.prod.yml down 2>/dev/null || docker-compose down || true
+                docker-compose -f docker-compose.prod.yml up -d --build 2>/dev/null || docker-compose up -d --build
               else
-                echo "No deployment method found"
+                echo "No deployment configuration found"
                 exit 1
               fi
             fi
             
             # Health check
             echo "Performing health check..."
-            sleep 10
+            sleep 15
             
-            # Try different health check endpoints
             HEALTH_OK=false
-            for endpoint in "http://localhost:8000/health" "http://localhost:8000/" "http://localhost:3000/health"; do
-              if curl -f "$endpoint" >/dev/null 2>&1; then
-                echo "Health check passed for $endpoint"
+            for endpoint in "http://localhost:8000/health" "http://localhost:8000/docs" "http://localhost:8000/" "http://localhost:3000/health"; do
+              echo "Checking $endpoint..."
+              if curl -f -s "$endpoint" >/dev/null 2>&1; then
+                echo "✓ Health check passed for $endpoint"
                 HEALTH_OK=true
                 break
               fi
             done
             
             if [ "$HEALTH_OK" = false ]; then
-              echo "Health check failed, attempting rollback..."
+              echo "❌ Health check failed, attempting rollback..."
               if [ -d "backup" ]; then
-                rm -rf current
+                rm -rf current || true
                 mv backup current
+                # Attempt to restart with backup
                 if [ -f "./scripts/deploy.sh" ]; then
-                  ./scripts/deploy.sh production
+                  ./scripts/deploy.sh production || true
                 fi
               fi
               exit 1
             fi
             
-            echo "Deployment completed successfully!"
+            echo "✅ Deployment completed successfully!"
