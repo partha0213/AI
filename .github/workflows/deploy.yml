@@ -6,48 +6,159 @@ on:
   release:
     types: [published]
 
+env:
+  PYTHON_VERSION: '3.11'
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4  # Updated to v4
       
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5  # Updated to v5
         with:
-          python-version: '3.11'
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'  # Enable pip caching
+      
+      - name: Create __init__.py files
+        run: |
+          touch ai-virtual-intern-backend/__init__.py
+          touch ai-virtual-intern-backend/app/__init__.py
+          touch tests/__init__.py
       
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-asyncio
+          pip install -r ai-virtual-intern-backend/requirements.txt
+          pip install pytest pytest-asyncio pytest-cov bandit safety
       
-      - name: Run tests
+      - name: Run tests with coverage
         run: |
-          PYTHONPATH=$PWD/ai-virtual-intern-backend pytest tests/ -v
+          cd ai-virtual-intern-backend
+          python -m pytest ../tests/ -v --cov=app --cov-report=xml
+        env:
+          PYTHONPATH: ${{ github.workspace }}/ai-virtual-intern-backend
       
-      - name: Run security check
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        if: always()
+        with:
+          file: ./ai-virtual-intern-backend/coverage.xml
+          fail_ci_if_error: false
+      
+      - name: Run security checks
         run: |
-          pip install bandit safety
-          bandit -r $PWD/ai-virtual-intern-backend/app/
-          safety check
+          cd ai-virtual-intern-backend
+          bandit -r app/ -f json -o bandit-report.json || true
+          safety check --json --output safety-report.json || true
+        continue-on-error: true
+      
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            ai-virtual-intern-backend/bandit-report.json
+            ai-virtual-intern-backend/safety-report.json
 
-  deploy:
+  build:
     needs: test
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Build Docker image
+        run: |
+          docker build -t ai-intern-platform:${{ github.sha }} .
+          docker tag ai-intern-platform:${{ github.sha }} ai-intern-platform:latest
+      
+      - name: Save Docker image
+        run: |
+          docker save ai-intern-platform:latest | gzip > ai-intern-platform.tar.gz
+      
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: ai-intern-platform.tar.gz
+          retention-days: 1
+
+  deploy:
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production  # Use GitHub environments for protection
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
       
       - name: Deploy to server
-        uses: appleboy/ssh-action@v0.1.7
+        uses: appleboy/ssh-action@v1.0.3  # Updated to latest version
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          timeout: 60s
+          script_stop: true  # Stop on first error
           script: |
+            set -e  # Exit on any error
+            
+            # Create backup of current deployment
             cd /opt/ai-intern-platform
-            git pull origin main
+            if [ -d "backup" ]; then rm -rf backup; fi
+            if [ -d "current" ]; then cp -r current backup; fi
+            
+            # Pull latest code
+            git fetch origin
+            git reset --hard origin/main
+            
+            # Make deploy script executable and run it
+            chmod +x ./scripts/deploy.sh
             ./scripts/deploy.sh production
+            
+            # Health check
+            sleep 10
+            if curl -f http://localhost:8000/health; then
+              echo "Deployment successful!"
+            else
+              echo "Health check failed, rolling back..."
+              if [ -d "backup" ]; then
+                rm -rf current
+                mv backup current
+                ./scripts/deploy.sh production
+              fi
+              exit 1
+            fi
+
+  notify:
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Notify deployment status
+        uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: ${{ job.status }}
+          channel: '#deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
