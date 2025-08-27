@@ -25,12 +25,12 @@ jobs:
       
       - name: Run tests
         run: |
-          PYTHONPATH=ai-virtual-intern-backend pytest tests/ -v
+          PYTHONPATH=$PWD/ai-virtual-intern-backend pytest tests/ -v
       
       - name: Run security check
         run: |
           pip install bandit safety
-          bandit -r ai-virtual-intern-backend/app/
+          bandit -r $PWD/ai-virtual-intern-backend/app/
           safety check
 
   deploy:
