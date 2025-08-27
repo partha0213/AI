@@ -8,7 +8,6 @@ on:
 
 env:
   PYTHON_VERSION: '3.11'
-  # Test environment variables
   SECRET_KEY: 'test-secret-key-for-ci-testing-only'
   DATABASE_URL: 'sqlite:///./test.db'
   OPENAI_API_KEY: 'test-openai-key'
@@ -33,12 +32,6 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
       
-      - name: Check project structure
-        run: |
-          echo "Current directory structure:"
-          find . -type d -name "*backend*" -o -name "*app*" -o -name "*tests*" | head -10
-          ls -la
-      
       - name: Create missing directories and __init__.py files
         run: |
           mkdir -p ai-virtual-intern-backend/app
@@ -50,18 +43,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          
           if [ -f "requirements.txt" ]; then
-            echo "Installing from root requirements.txt"
             pip install -r requirements.txt
           elif [ -f "ai-virtual-intern-backend/requirements.txt" ]; then
-            echo "Installing from backend requirements.txt"
             pip install -r ai-virtual-intern-backend/requirements.txt
           else
-            echo "Installing basic dependencies"
             pip install fastapi uvicorn sqlalchemy pytest pytest-asyncio pytest-cov pydantic-settings
           fi
-          
           pip install pytest pytest-asyncio pytest-cov bandit safety
       
       - name: Create test environment file
@@ -82,20 +70,14 @@ jobs:
       - name: Run tests with coverage
         run: |
           echo "Running tests..."
-          
           if [ -d "tests" ] && [ "$(find tests -name "test_*.py" -o -name "*_test.py" | wc -l)" -gt 0 ]; then
-            # Set working directory to backend and run tests
             cd ai-virtual-intern-backend
-            
-            # Create a simple test database
             python -c "
-import sqlite3
-conn = sqlite3.connect('test.db')
-conn.close()
-print('Test database created')
-            " || true
-            
-            # Run pytest with proper environment
+          import sqlite3
+          conn = sqlite3.connect('test.db')
+          conn.close()
+          print('Test database created')
+            "
             python -m pytest ../tests/ -v --cov=app --cov-report=xml --cov-report=term --tb=short
           else
             echo "No test files found, creating dummy coverage file"
@@ -104,7 +86,6 @@ print('Test database created')
           fi
         env:
           PYTHONPATH: ${{ github.workspace }}/ai-virtual-intern-backend
-          # Override with test values
           SECRET_KEY: 'test-secret-key-for-ci-testing-only'
           DATABASE_URL: 'sqlite:///./test.db'
           OPENAI_API_KEY: 'test-openai-key'
@@ -118,7 +99,7 @@ print('Test database created')
       
       - name: Upload coverage reports
         uses: codecov/codecov-action@v3
-        if: always() && hashFiles('ai-virtual-intern-backend/coverage.xml') != ''
+        if: always()
         with:
           file: ./ai-virtual-intern-backend/coverage.xml
           fail_ci_if_error: false
@@ -128,7 +109,6 @@ print('Test database created')
       - name: Run security checks
         run: |
           echo "Running security checks..."
-          
           if [ -d "ai-virtual-intern-backend/app" ] && [ "$(find ai-virtual-intern-backend/app -name "*.py" | wc -l)" -gt 0 ]; then
             cd ai-virtual-intern-backend
             bandit -r app/ -f json -o bandit-report.json || echo "Bandit completed with warnings"
@@ -137,18 +117,7 @@ print('Test database created')
             mkdir -p ai-virtual-intern-backend
             echo '{"results": [], "metrics": {"_totals": {"CONFIDENCE.HIGH": 0}}}' > ai-virtual-intern-backend/bandit-report.json
           fi
-          
           safety check --json --output ai-virtual-intern-backend/safety-report.json || echo "Safety check completed"
-        continue-on-error: true
-      
-      - name: Upload security reports
-        uses: actions/upload-artifact@v4
-        if: always() && (hashFiles('ai-virtual-intern-backend/bandit-report.json') != '' || hashFiles('ai-virtual-intern-backend/safety-report.json') != '')
-        with:
-          name: security-reports
-          path: |
-            ai-virtual-intern-backend/bandit-report.json
-            ai-virtual-intern-backend/safety-report.json
         continue-on-error: true
 
   deploy:
@@ -172,23 +141,16 @@ print('Test database created')
           script_stop: true
           script: |
             set -e
-            
             echo "Starting deployment..."
             cd /opt/ai-intern-platform
-            
-            # Create backup
             if [ -d "current" ]; then
               echo "Creating backup..."
               rm -rf backup 2>/dev/null || true
               cp -r current backup
             fi
-            
-            # Pull latest changes
             echo "Pulling latest code..."
             git fetch origin
             git reset --hard origin/main
-            
-            # Run deployment script
             echo "Running deployment script..."
             if [ -f "./scripts/deploy.sh" ]; then
               chmod +x ./scripts/deploy.sh
@@ -203,11 +165,8 @@ print('Test database created')
                 exit 1
               fi
             fi
-            
-            # Health check
             echo "Performing health check..."
             sleep 15
-            
             HEALTH_OK=false
             for endpoint in "http://localhost:8000/health" "http://localhost:8000/docs" "http://localhost:8000/" "http://localhost:3000/health"; do
               echo "Checking $endpoint..."
@@ -217,18 +176,15 @@ print('Test database created')
                 break
               fi
             done
-            
             if [ "$HEALTH_OK" = false ]; then
               echo "❌ Health check failed, attempting rollback..."
               if [ -d "backup" ]; then
                 rm -rf current || true
                 mv backup current
-                # Attempt to restart with backup
                 if [ -f "./scripts/deploy.sh" ]; then
                   ./scripts/deploy.sh production || true
                 fi
               fi
               exit 1
             fi
-            
             echo "✅ Deployment completed successfully!"
