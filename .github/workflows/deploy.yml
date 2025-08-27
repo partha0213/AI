@@ -24,12 +24,13 @@ jobs:
           pip install pytest pytest-asyncio
       
       - name: Run tests
-        run: pytest tests/ -v
+        run: |
+          PYTHONPATH=ai-virtual-intern-backend pytest tests/ -v
       
       - name: Run security check
         run: |
           pip install bandit safety
-          bandit -r app/
+          bandit -r ai-virtual-intern-backend/app/
           safety check
 
   deploy:
